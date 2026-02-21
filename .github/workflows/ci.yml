@@ -39,6 +39,7 @@ jobs:
             libxinerama-dev \
             libxcursor-dev \
             libxi-dev \
+            libxtst-dev \
             libxext-dev \
             libgl1-mesa-dev
 
