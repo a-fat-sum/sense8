@@ -20,11 +20,19 @@ jobs:
       - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@v4
 
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgDirectory: "${{ github.workspace }}/vcpkg"
-          vcpkgJsonGlob: "${{ github.workspace }}/vcpkg.json"
+      - name: Setup vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$env:GITHUB_WORKSPACE/vcpkg"
+          & "$env:GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.bat"
+
+      - name: Setup vcpkg (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$GITHUB_WORKSPACE/vcpkg"
+          "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh"
 
       - name: Configure
         run: cmake --preset ci-release
