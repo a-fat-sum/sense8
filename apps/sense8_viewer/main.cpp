@@ -650,20 +650,44 @@ std::vector<cv::Point3f> TriangulateDebugPoints(const FrontendTrackingState& tra
   cv::Mat homogeneous_points;
   cv::triangulatePoints(projection_1, projection_2, previous_points, current_points, homogeneous_points);
 
-  triangulated_points.reserve(static_cast<std::size_t>(homogeneous_points.cols));
-  for (int column = 0; column < homogeneous_points.cols; ++column) {
-    if (!inlier_mask.empty() && inlier_mask.at<unsigned char>(column) == 0) {
-      continue;
+  cv::Mat homogeneous_points_64f;
+  if (homogeneous_points.depth() == CV_64F) {
+    homogeneous_points_64f = homogeneous_points;
+  } else {
+    homogeneous_points.convertTo(homogeneous_points_64f, CV_64F);
+  }
+
+  cv::Mat inlier_mask_8u;
+  if (inlier_mask.empty()) {
+    inlier_mask_8u = inlier_mask;
+  } else if (inlier_mask.depth() == CV_8U) {
+    inlier_mask_8u = inlier_mask;
+  } else {
+    inlier_mask.convertTo(inlier_mask_8u, CV_8U);
+  }
+
+  triangulated_points.reserve(static_cast<std::size_t>(homogeneous_points_64f.cols));
+  for (int column = 0; column < homogeneous_points_64f.cols; ++column) {
+    if (!inlier_mask_8u.empty()) {
+      unsigned char mask_value = 0;
+      if (inlier_mask_8u.rows == 1) {
+        mask_value = inlier_mask_8u.at<unsigned char>(0, column);
+      } else {
+        mask_value = inlier_mask_8u.at<unsigned char>(column, 0);
+      }
+      if (mask_value == 0) {
+        continue;
+      }
     }
 
-    const double w = homogeneous_points.at<double>(3, column);
+    const double w = homogeneous_points_64f.at<double>(3, column);
     if (std::abs(w) < 1e-9) {
       continue;
     }
 
-    const double x = homogeneous_points.at<double>(0, column) / w;
-    const double y = homogeneous_points.at<double>(1, column) / w;
-    const double z = homogeneous_points.at<double>(2, column) / w;
+    const double x = homogeneous_points_64f.at<double>(0, column) / w;
+    const double y = homogeneous_points_64f.at<double>(1, column) / w;
+    const double z = homogeneous_points_64f.at<double>(2, column) / w;
     if (z <= 0.0 || z > 200.0) {
       continue;
     }
@@ -706,6 +730,9 @@ void DrawSimple3DScene(const std::vector<cv::Point3f>& gt_trajectory,
                        cv::Point3f* orbit_target,
                        bool show_gt,
                        bool show_triangulated) {
+  constexpr std::size_t kMaxGtPolylinePoints = 3000;
+  constexpr std::size_t kMaxTriangulatedDrawPoints = 2000;
+
   ImVec2 canvas_size = ImGui::GetContentRegionAvail();
   canvas_size.x = std::max(canvas_size.x, 320.0F);
   canvas_size.y = std::max(canvas_size.y, 260.0F);
@@ -780,9 +807,13 @@ void DrawSimple3DScene(const std::vector<cv::Point3f>& gt_trajectory,
   draw_axis(cv::Point3f(0.0F, 0.0F, 0.0F), cv::Point3f(0.0F, 0.0F, 1.0F), IM_COL32(80, 160, 255, 255));
 
   if (show_gt && gt_trajectory.size() >= 2) {
+    const std::size_t gt_draw_count = std::min(gt_trajectory.size(), kMaxGtPolylinePoints);
+    const std::size_t gt_stride = std::max<std::size_t>(1, gt_trajectory.size() / gt_draw_count);
+
     ImVec2 previous;
     bool has_previous = false;
-    for (const auto& point : gt_trajectory) {
+    for (std::size_t index = 0; index < gt_trajectory.size(); index += gt_stride) {
+      const auto& point = gt_trajectory[index];
       ImVec2 projected;
       if (!ProjectWorldPoint(point, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &projected)) {
         has_previous = false;
@@ -794,10 +825,23 @@ void DrawSimple3DScene(const std::vector<cv::Point3f>& gt_trajectory,
       previous = projected;
       has_previous = true;
     }
+
+    if ((gt_trajectory.size() - 1) % gt_stride != 0) {
+      const auto& point = gt_trajectory.back();
+      ImVec2 projected;
+      if (ProjectWorldPoint(point, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &projected) && has_previous) {
+        draw_list->AddLine(previous, projected, IM_COL32(120, 220, 255, 230), 2.0F);
+      }
+    }
   }
 
   if (show_triangulated) {
-    for (const auto& point : triangulated_points) {
+    const std::size_t tri_draw_count = std::min(triangulated_points.size(), kMaxTriangulatedDrawPoints);
+    const std::size_t tri_stride = triangulated_points.empty()
+                                       ? 1
+                                       : std::max<std::size_t>(1, triangulated_points.size() / tri_draw_count);
+    for (std::size_t index = 0; index < triangulated_points.size(); index += tri_stride) {
+      const auto& point = triangulated_points[index];
       ImVec2 projected;
       if (!ProjectWorldPoint(point, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &projected)) {
         continue;
