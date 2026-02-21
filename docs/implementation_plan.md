@@ -165,6 +165,23 @@ Exit criteria:
 - Stable feature tracks and IMU propagation visible in playback.
 - Unit tests validate Jacobians / preintegration consistency.
 
+## Stage 1.5 — 3D Viewer Scaffold (visualization-first, 1–2 weeks)
+Deliverables:
+- Add a 3D viewport in the viewer that is independent from estimator internals.
+- Show ground-truth trajectory polyline from dataset adapters (where GT exists).
+- Add two-view triangulated landmarks layer (debug visualization from matched features).
+- Render camera frusta / pose trail for replay cursor and keyframes.
+- Define trajectory channels in viewer: `GT`, `Estimated`, `Reference` (empty channels allowed).
+
+Implementation guardrails:
+- Keep this as a visualization module only; no estimator coupling.
+- Use clear frame conventions in UI (`world`, `body`, `cam0`) and document transforms.
+- Treat triangulated points as debug-quality (no map persistence assumptions yet).
+
+Exit criteria:
+- EuRoC replay shows GT trajectory in 3D plus optional triangulated points without flicker.
+- Viewer can overlay multiple trajectory channels even if only GT is populated.
+
 ## Stage 2 — Monocular Visual-Inertial Initialization + Sliding Window VIO (4–6 weeks)
 Deliverables:
 - Visual initialization (up-to-scale) + IMU alignment to metric scale.
@@ -313,7 +330,7 @@ Release gates (recommended):
 Recommended first baseline milestone:
 1. EuRoC monocular+IMU VIO working.
 2. KITTI/Oxford driving sequence with acceptable drift.
-3. Viewer displaying trajectory + sparse landmarks + timing diagnostics.
+3. Viewer displaying 3D GT trajectory + debug triangulated landmarks + timing diagnostics.
 
 ---
 
@@ -333,12 +350,13 @@ Mitigations:
 
 ---
 
-## 10) What to Build Immediately (next 2 weeks)
+## 10) What to Build Immediately (next 2–3 weeks)
 
-1. Create project skeleton + dependency bootstrap.
-2. Implement dataset player and synchronized packet bus.
-3. Add camera calibration parser + IMU model.
-4. Implement feature tracker and basic visualization overlays.
-5. Add IMU preintegration tests and propagation demo.
+1. Keep stabilizing CI and deterministic replay workflow.
+2. Add 3D viewport to viewer with camera controls (orbit/pan/zoom) and frame axes.
+3. Visualize GT trajectory from EuRoC in 3D.
+4. Add two-view triangulation debug layer (from inlier matches) in viewer.
+5. Introduce trajectory channels: `GT` now, `Estimated` placeholder for Stage 2.
+6. Add a small validation checklist: frame alignment, scale sanity, and render stability.
 
-This gives a visible progress demo before full SLAM is complete.
+This creates a strong visualization baseline now, so estimated trajectory can be dropped in later with minimal UI churn.
