@@ -12,7 +12,7 @@ option(SENSE8_BUILD_VIEWER "Build Dear ImGui viewer app" OFF)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(Eigen3 CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
-find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc calib3d features2d video)
+find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc imgcodecs calib3d features2d video)
 find_package(spdlog CONFIG REQUIRED)
 find_package(yaml-cpp CONFIG REQUIRED)
 

@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <string>
 #include <variant>
 #include <vector>
@@ -11,13 +12,131 @@
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
 
 #include "sense8/io/euroc_dataset.hpp"
 #include "sense8/io/replay_cursor.hpp"
 #include "sense8/io/sensor_packets.hpp"
 
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+
 namespace {
+
+struct FrameTexture {
+  GLuint texture_id = 0;
+  int width = 0;
+  int height = 0;
+  std::string loaded_image_path;
+  std::string failed_image_path;
+};
+
+void EnsureTexture(FrameTexture* frame_texture) {
+  if (frame_texture->texture_id != 0) {
+    return;
+  }
+
+  glGenTextures(1, &frame_texture->texture_id);
+  glBindTexture(GL_TEXTURE_2D, frame_texture->texture_id);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void DestroyTexture(FrameTexture* frame_texture) {
+  if (frame_texture->texture_id != 0) {
+    glDeleteTextures(1, &frame_texture->texture_id);
+    frame_texture->texture_id = 0;
+  }
+  frame_texture->width = 0;
+  frame_texture->height = 0;
+  frame_texture->loaded_image_path.clear();
+  frame_texture->failed_image_path.clear();
+}
+
+std::size_t FindCameraIndexForTimestamp(const std::vector<sense8::io::CameraFrame>& camera_frames, std::int64_t timestamp_ns) {
+  if (camera_frames.empty()) {
+    return camera_frames.size();
+  }
+
+  const auto it = std::upper_bound(
+      camera_frames.begin(), camera_frames.end(), timestamp_ns, [](std::int64_t ts, const sense8::io::CameraFrame& frame) {
+        return ts < frame.timestamp_ns;
+      });
+
+  if (it == camera_frames.begin()) {
+    return camera_frames.size();
+  }
+
+  return static_cast<std::size_t>(std::distance(camera_frames.begin(), it - 1));
+}
+
+bool UpdateFrameTexture(const std::vector<sense8::io::CameraFrame>& camera_frames,
+                        std::int64_t timestamp_ns,
+                        FrameTexture* frame_texture,
+                        std::string* error_message) {
+  const std::size_t camera_index = FindCameraIndexForTimestamp(camera_frames, timestamp_ns);
+  if (camera_index >= camera_frames.size()) {
+    if (error_message != nullptr) {
+      *error_message = "No camera frame available at this timestamp yet";
+    }
+    return false;
+  }
+
+  const std::string& image_path = camera_frames[camera_index].image_path;
+  if (frame_texture->loaded_image_path == image_path && frame_texture->texture_id != 0) {
+    return true;
+  }
+
+  if (frame_texture->failed_image_path == image_path) {
+    if (error_message != nullptr) {
+      *error_message = std::string("Failed to read image: ") + image_path;
+    }
+    return false;
+  }
+
+  const cv::Mat bgr_image = cv::imread(image_path, cv::IMREAD_COLOR);
+  if (bgr_image.empty()) {
+    frame_texture->failed_image_path = image_path;
+    if (error_message != nullptr) {
+      *error_message = std::string("Failed to read image: ") + image_path;
+    }
+    return false;
+  }
+
+  cv::Mat rgba_image;
+  cv::cvtColor(bgr_image, rgba_image, cv::COLOR_BGR2RGBA);
+
+  EnsureTexture(frame_texture);
+  glBindTexture(GL_TEXTURE_2D, frame_texture->texture_id);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(
+      GL_TEXTURE_2D,
+      0,
+      GL_RGBA,
+      rgba_image.cols,
+      rgba_image.rows,
+      0,
+      GL_RGBA,
+      GL_UNSIGNED_BYTE,
+      rgba_image.data);
+  glBindTexture(GL_TEXTURE_2D, 0);
+
+  frame_texture->width = rgba_image.cols;
+  frame_texture->height = rgba_image.rows;
+  frame_texture->loaded_image_path = image_path;
+  frame_texture->failed_image_path.clear();
+  if (error_message != nullptr) {
+    error_message->clear();
+  }
+
+  return true;
+}
 
 std::size_t FindImuUpperBound(const std::vector<sense8::io::ImuSample>& imu_samples, std::int64_t timestamp_ns) {
   const auto it = std::upper_bound(
@@ -140,6 +259,8 @@ int main(int argc, char** argv) {
   double previous_time_s = glfwGetTime();
   float timeline_ratio = 0.0F;
   float imu_window_seconds = 5.0F;
+  FrameTexture frame_texture;
+  std::string frame_error;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -183,14 +304,30 @@ int main(int argc, char** argv) {
         ImGui::Text("Current packet index: %zu", cursor.packet_index());
         ImGui::Text("Timestamp: %lld ns", static_cast<long long>(cursor.current_timestamp_ns()));
 
+        const bool has_frame_texture = UpdateFrameTexture(
+            sequence.camera_frames,
+            cursor.current_timestamp_ns(),
+            &frame_texture,
+            &frame_error);
+
+        ImGui::SeparatorText("Camera View");
+        if (has_frame_texture) {
+          const float available_width = ImGui::GetContentRegionAvail().x;
+          const float aspect_ratio = static_cast<float>(frame_texture.height) / static_cast<float>(frame_texture.width);
+          const float image_width = std::max(320.0F, available_width);
+          const float image_height = image_width * aspect_ratio;
+          ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(image_width, image_height));
+          ImGui::TextWrapped("Image: %s", frame_texture.loaded_image_path.c_str());
+        } else {
+          ImGui::TextWrapped("%s", frame_error.c_str());
+        }
+
         if (!sequence.merged_packets.empty()) {
           const auto& packet = sequence.merged_packets[cursor.packet_index()];
           if (std::holds_alternative<sense8::io::ImuSample>(packet.payload)) {
             ImGui::Text("Payload: IMU");
           } else {
-            const auto& frame = std::get<sense8::io::CameraFrame>(packet.payload);
             ImGui::Text("Payload: Camera");
-            ImGui::TextWrapped("Image: %s", frame.image_path.c_str());
           }
         }
 
@@ -223,6 +360,8 @@ int main(int argc, char** argv) {
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();
+
+  DestroyTexture(&frame_texture);
 
   glfwDestroyWindow(window);
   glfwTerminate();
