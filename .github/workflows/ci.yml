@@ -34,7 +34,14 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git "$GITHUB_WORKSPACE/vcpkg"
           "$GITHUB_WORKSPACE/vcpkg/bootstrap-vcpkg.sh"
 
-      - name: Configure
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake --preset ci-release -G Ninja
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
         run: cmake --preset ci-release
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
