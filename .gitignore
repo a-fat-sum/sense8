@@ -1,0 +1,15 @@
+# Build artifacts
+/build/
+/out/
+
+# Local dependency workspace (bootstrap scripts)
+/.vcpkg/
+
+# IDE/OS files
+/.vs/
+.vscode/*.db
+*.user
+*.suo
+
+# CMake-generated files
+CMakeUserPresets.json
