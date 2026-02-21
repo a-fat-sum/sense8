@@ -28,6 +28,11 @@ jobs:
             ninja-build \
             build-essential \
             pkg-config \
+            gperf \
+            autoconf \
+            autoconf-archive \
+            automake \
+            libtool \
             libx11-dev \
             libxrandr-dev \
             libxinerama-dev \
