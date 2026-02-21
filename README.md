@@ -49,7 +49,21 @@ Viewer target `sense8_viewer` is available behind `SENSE8_BUILD_VIEWER`.
 ```powershell
 cmake --preset debug -DSENSE8_BUILD_VIEWER=ON
 cmake --build --preset debug --parallel
+./build/debug/apps/sense8_viewer/Debug/sense8_viewer.exe --dataset E:/Repos/sense8/datasets/euroc/MH_01_easy
 ```
+
+## EuRoC dataset location
+
+Full EuRoC datasets are **not downloaded automatically**.
+
+Place extracted sequences under:
+
+- `datasets/euroc/<sequence_name>/mav0/...`
+
+Example:
+
+- `datasets/euroc/MH_01_easy/mav0/imu0/data.csv`
+- `datasets/euroc/MH_01_easy/mav0/cam0/data.csv`
 
 ## Current skeleton targets
 - `sense8_common` (core shared library)

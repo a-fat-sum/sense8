@@ -3,6 +3,7 @@ find_package(GTest CONFIG REQUIRED)
 add_executable(sense8_common_tests
   common_version_test.cpp
   euroc_dataset_test.cpp
+  replay_cursor_test.cpp
 )
 
 target_link_libraries(sense8_common_tests

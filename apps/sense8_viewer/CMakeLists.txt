@@ -6,11 +6,18 @@ add_executable(sense8_viewer
   main.cpp
 )
 
+target_include_directories(sense8_viewer
+  PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+)
+
 target_link_libraries(sense8_viewer
   PRIVATE
+    CLI11::CLI11
     imgui::imgui
     glfw
     OpenGL::GL
+    ${OpenCV_LIBS}
     sense8_io
     sense8_common
 )

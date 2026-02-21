@@ -1,5 +1,6 @@
 add_library(sense8_io STATIC
   src/euroc_dataset.cpp
+  src/replay_cursor.cpp
 )
 
 target_include_directories(sense8_io

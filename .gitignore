@@ -13,3 +13,7 @@
 
 # CMake-generated files
 CMakeUserPresets.json
+
+# Local datasets (keep folder docs)
+/datasets/*
+!/datasets/README.md
