@@ -6,24 +6,17 @@
     "cli11",
     "eigen3",
     "fmt",
+    "glfw3",
     "gtest",
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ]
+    },
     "opencv4",
     "spdlog",
     "yaml-cpp"
-  ],
-  "features": {
-    "viewer": {
-      "description": "Build dependencies for Dear ImGui + GLFW local viewer",
-      "dependencies": [
-        "glfw3",
-        {
-          "name": "imgui",
-          "features": [
-            "glfw-binding",
-            "opengl3-binding"
-          ]
-        }
-      ]
-    }
-  }
+  ]
 }

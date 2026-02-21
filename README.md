@@ -46,17 +46,13 @@ GitHub Actions workflow at `.github/workflows/ci.yml` builds and tests on:
 
 Viewer target `sense8_viewer` is available behind `SENSE8_BUILD_VIEWER`.
 
-Viewer dependencies are optional in `vcpkg` manifest feature `viewer`.
-
 ```powershell
-$env:VCPKG_MANIFEST_FEATURES = "viewer"
 cmake --preset debug -DSENSE8_BUILD_VIEWER=ON
 cmake --build --preset debug --parallel
 ./build/debug/apps/sense8_viewer/Debug/sense8_viewer.exe --dataset E:/Repos/sense8/datasets/euroc/MH_01_easy
 ```
 
 ```bash
-export VCPKG_MANIFEST_FEATURES=viewer
 cmake --preset debug -DSENSE8_BUILD_VIEWER=ON
 cmake --build --preset debug --parallel
 ./build/debug/apps/sense8_viewer/sense8_viewer --dataset ./datasets/euroc/MH_01_easy

@@ -1,8 +1,12 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <limits>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -12,9 +16,12 @@
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <spdlog/spdlog.h>
+#include <yaml-cpp/yaml.h>
 
 #include "sense8/io/euroc_dataset.hpp"
 #include "sense8/io/replay_cursor.hpp"
@@ -32,7 +39,201 @@ struct FrameTexture {
   int height = 0;
   std::string loaded_image_path;
   std::string failed_image_path;
+  std::vector<cv::KeyPoint> orb_keypoints;
+  double orb_compute_ms = 0.0;
+  bool orb_enabled_for_texture = false;
+  int orb_max_features_for_texture = 0;
+  bool tracking_enabled_for_texture = false;
 };
+
+struct FrontendTrack {
+  cv::Point2f previous_point;
+  cv::Point2f current_point;
+};
+
+struct FrontendMetrics {
+  int keypoints_current = 0;
+  int mutual_matches = 0;
+  int inlier_matches = 0;
+  double detect_compute_ms = 0.0;
+  double match_ms = 0.0;
+  double ransac_ms = 0.0;
+  std::string geometric_model = "none";
+};
+
+struct FrontendTrackingState {
+  std::vector<cv::KeyPoint> previous_keypoints;
+  cv::Mat previous_descriptors;
+  std::size_t previous_camera_index = 0;
+  bool has_previous_frame = false;
+
+  std::vector<FrontendTrack> inlier_tracks;
+  FrontendMetrics metrics;
+
+  cv::Mat camera_matrix;
+  bool has_camera_intrinsics = false;
+};
+
+bool LoadEurocIntrinsics(const std::filesystem::path& dataset_root, cv::Mat* camera_matrix, std::string* error_message) {
+  try {
+    const auto sensor_yaml_path = dataset_root / "mav0" / "cam0" / "sensor.yaml";
+    if (!std::filesystem::exists(sensor_yaml_path)) {
+      if (error_message != nullptr) {
+        *error_message = "cam0/sensor.yaml not found; using fallback geometric model";
+      }
+      return false;
+    }
+
+    const YAML::Node root = YAML::LoadFile(sensor_yaml_path.string());
+    const YAML::Node intrinsics = root["intrinsics"];
+    if (!intrinsics || !intrinsics.IsSequence() || intrinsics.size() < 4) {
+      if (error_message != nullptr) {
+        *error_message = "Invalid intrinsics array in cam0/sensor.yaml";
+      }
+      return false;
+    }
+
+    const double fx = intrinsics[0].as<double>();
+    const double fy = intrinsics[1].as<double>();
+    const double cx = intrinsics[2].as<double>();
+    const double cy = intrinsics[3].as<double>();
+
+    *camera_matrix = (cv::Mat_<double>(3, 3) << fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0);
+    return true;
+  } catch (const std::exception& ex) {
+    if (error_message != nullptr) {
+      *error_message = std::string("Failed to load cam0 intrinsics: ") + ex.what();
+    }
+    return false;
+  }
+}
+
+std::vector<cv::DMatch> ComputeMutualRatioMatches(const cv::Mat& previous_descriptors, const cv::Mat& current_descriptors) {
+  constexpr float kRatioThreshold = 0.75F;
+
+  cv::BFMatcher matcher(cv::NORM_HAMMING, false);
+  std::vector<std::vector<cv::DMatch>> forward_knn;
+  std::vector<std::vector<cv::DMatch>> reverse_knn;
+  matcher.knnMatch(previous_descriptors, current_descriptors, forward_knn, 2);
+  matcher.knnMatch(current_descriptors, previous_descriptors, reverse_knn, 2);
+
+  std::vector<cv::DMatch> forward_ratio;
+  forward_ratio.reserve(forward_knn.size());
+  for (const auto& candidate_set : forward_knn) {
+    if (candidate_set.size() < 2) {
+      continue;
+    }
+    if (candidate_set[0].distance < kRatioThreshold * candidate_set[1].distance) {
+      forward_ratio.push_back(candidate_set[0]);
+    }
+  }
+
+  std::set<std::pair<int, int>> reverse_ratio_pairs;
+  for (const auto& candidate_set : reverse_knn) {
+    if (candidate_set.size() < 2) {
+      continue;
+    }
+    if (candidate_set[0].distance < kRatioThreshold * candidate_set[1].distance) {
+      reverse_ratio_pairs.insert({candidate_set[0].queryIdx, candidate_set[0].trainIdx});
+    }
+  }
+
+  std::vector<cv::DMatch> mutual_matches;
+  mutual_matches.reserve(forward_ratio.size());
+  for (const auto& match : forward_ratio) {
+    const auto reverse_key = std::pair<int, int>{match.trainIdx, match.queryIdx};
+    if (reverse_ratio_pairs.contains(reverse_key)) {
+      mutual_matches.push_back(match);
+    }
+  }
+
+  return mutual_matches;
+}
+
+void ResetTrackingState(FrontendTrackingState* tracking_state) {
+  tracking_state->previous_keypoints.clear();
+  tracking_state->previous_descriptors.release();
+  tracking_state->previous_camera_index = 0;
+  tracking_state->has_previous_frame = false;
+  tracking_state->inlier_tracks.clear();
+  tracking_state->metrics = FrontendMetrics{};
+}
+
+void UpdateTracking(const std::vector<cv::KeyPoint>& current_keypoints,
+                    const cv::Mat& current_descriptors,
+                    std::size_t camera_index,
+                    FrontendTrackingState* tracking_state) {
+  tracking_state->inlier_tracks.clear();
+  tracking_state->metrics = FrontendMetrics{};
+  tracking_state->metrics.keypoints_current = static_cast<int>(current_keypoints.size());
+
+  if (current_descriptors.empty() || current_keypoints.empty()) {
+    tracking_state->previous_keypoints = current_keypoints;
+    tracking_state->previous_descriptors = current_descriptors.clone();
+    tracking_state->previous_camera_index = camera_index;
+    tracking_state->has_previous_frame = true;
+    return;
+  }
+
+  if (!tracking_state->has_previous_frame ||
+      tracking_state->previous_descriptors.empty() ||
+      camera_index != tracking_state->previous_camera_index + 1) {
+    tracking_state->previous_keypoints = current_keypoints;
+    tracking_state->previous_descriptors = current_descriptors.clone();
+    tracking_state->previous_camera_index = camera_index;
+    tracking_state->has_previous_frame = true;
+    return;
+  }
+
+  const auto match_start = std::chrono::steady_clock::now();
+  const std::vector<cv::DMatch> mutual_matches = ComputeMutualRatioMatches(
+      tracking_state->previous_descriptors,
+      current_descriptors);
+  const auto match_end = std::chrono::steady_clock::now();
+
+  tracking_state->metrics.mutual_matches = static_cast<int>(mutual_matches.size());
+  tracking_state->metrics.match_ms = std::chrono::duration<double, std::milli>(match_end - match_start).count();
+
+  if (mutual_matches.size() >= 8) {
+    std::vector<cv::Point2f> previous_points;
+    std::vector<cv::Point2f> current_points;
+    previous_points.reserve(mutual_matches.size());
+    current_points.reserve(mutual_matches.size());
+
+    for (const auto& match : mutual_matches) {
+      previous_points.push_back(tracking_state->previous_keypoints[match.queryIdx].pt);
+      current_points.push_back(current_keypoints[match.trainIdx].pt);
+    }
+
+    const auto ransac_start = std::chrono::steady_clock::now();
+    std::vector<unsigned char> inlier_mask;
+
+    if (tracking_state->has_camera_intrinsics && !tracking_state->camera_matrix.empty()) {
+      tracking_state->metrics.geometric_model = "Essential";
+      cv::findEssentialMat(previous_points, current_points, tracking_state->camera_matrix, cv::RANSAC, 0.999, 1.0, inlier_mask);
+    } else {
+      tracking_state->metrics.geometric_model = "Fundamental";
+      cv::findFundamentalMat(previous_points, current_points, cv::FM_RANSAC, 1.0, 0.999, inlier_mask);
+    }
+
+    const auto ransac_end = std::chrono::steady_clock::now();
+    tracking_state->metrics.ransac_ms = std::chrono::duration<double, std::milli>(ransac_end - ransac_start).count();
+
+    for (std::size_t index = 0; index < inlier_mask.size(); ++index) {
+      if (inlier_mask[index] == 0) {
+        continue;
+      }
+      tracking_state->inlier_tracks.push_back(FrontendTrack{previous_points[index], current_points[index]});
+    }
+  }
+
+  tracking_state->metrics.inlier_matches = static_cast<int>(tracking_state->inlier_tracks.size());
+
+  tracking_state->previous_keypoints = current_keypoints;
+  tracking_state->previous_descriptors = current_descriptors.clone();
+  tracking_state->previous_camera_index = camera_index;
+  tracking_state->has_previous_frame = true;
+}
 
 void EnsureTexture(FrameTexture* frame_texture) {
   if (frame_texture->texture_id != 0) {
@@ -57,6 +258,21 @@ void DestroyTexture(FrameTexture* frame_texture) {
   frame_texture->height = 0;
   frame_texture->loaded_image_path.clear();
   frame_texture->failed_image_path.clear();
+  frame_texture->orb_keypoints.clear();
+  frame_texture->orb_compute_ms = 0.0;
+  frame_texture->orb_enabled_for_texture = false;
+  frame_texture->orb_max_features_for_texture = 0;
+}
+
+void ComputeOrbFeatures(const cv::Mat& bgr_image,
+                        int max_features,
+                        std::vector<cv::KeyPoint>* keypoints,
+                        double* compute_ms) {
+  const auto start = std::chrono::steady_clock::now();
+  const auto detector = cv::ORB::create(max_features);
+  detector->detect(bgr_image, *keypoints);
+  const auto end = std::chrono::steady_clock::now();
+  *compute_ms = std::chrono::duration<double, std::milli>(end - start).count();
 }
 
 std::size_t FindCameraIndexForTimestamp(const std::vector<sense8::io::CameraFrame>& camera_frames, std::int64_t timestamp_ns) {
@@ -78,6 +294,10 @@ std::size_t FindCameraIndexForTimestamp(const std::vector<sense8::io::CameraFram
 
 bool UpdateFrameTexture(const std::vector<sense8::io::CameraFrame>& camera_frames,
                         std::int64_t timestamp_ns,
+                        bool compute_orb,
+                        int orb_max_features,
+                        bool compute_tracking,
+                        FrontendTrackingState* tracking_state,
                         FrameTexture* frame_texture,
                         std::string* error_message) {
   const std::size_t camera_index = FindCameraIndexForTimestamp(camera_frames, timestamp_ns);
@@ -89,7 +309,10 @@ bool UpdateFrameTexture(const std::vector<sense8::io::CameraFrame>& camera_frame
   }
 
   const std::string& image_path = camera_frames[camera_index].image_path;
-  if (frame_texture->loaded_image_path == image_path && frame_texture->texture_id != 0) {
+  const bool orb_settings_match = frame_texture->orb_enabled_for_texture == compute_orb &&
+                                  frame_texture->orb_max_features_for_texture == orb_max_features;
+  const bool tracking_settings_match = frame_texture->tracking_enabled_for_texture == compute_tracking;
+  if (frame_texture->loaded_image_path == image_path && frame_texture->texture_id != 0 && orb_settings_match && tracking_settings_match) {
     return true;
   }
 
@@ -112,6 +335,27 @@ bool UpdateFrameTexture(const std::vector<sense8::io::CameraFrame>& camera_frame
   cv::Mat rgba_image;
   cv::cvtColor(bgr_image, rgba_image, cv::COLOR_BGR2RGBA);
 
+  std::vector<cv::KeyPoint> detected_keypoints;
+  cv::Mat detected_descriptors;
+  frame_texture->orb_compute_ms = 0.0;
+  if (compute_orb || compute_tracking) {
+    const auto detect_start = std::chrono::steady_clock::now();
+    const auto detector = cv::ORB::create(orb_max_features);
+    detector->detectAndCompute(bgr_image, cv::Mat(), detected_keypoints, detected_descriptors);
+    const auto detect_end = std::chrono::steady_clock::now();
+    frame_texture->orb_compute_ms = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
+    frame_texture->orb_keypoints = detected_keypoints;
+  } else {
+    frame_texture->orb_keypoints.clear();
+  }
+
+  if (compute_tracking && tracking_state != nullptr) {
+    UpdateTracking(detected_keypoints, detected_descriptors, camera_index, tracking_state);
+    tracking_state->metrics.detect_compute_ms = frame_texture->orb_compute_ms;
+  } else if (tracking_state != nullptr) {
+    ResetTrackingState(tracking_state);
+  }
+
   EnsureTexture(frame_texture);
   glBindTexture(GL_TEXTURE_2D, frame_texture->texture_id);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -131,6 +375,9 @@ bool UpdateFrameTexture(const std::vector<sense8::io::CameraFrame>& camera_frame
   frame_texture->height = rgba_image.rows;
   frame_texture->loaded_image_path = image_path;
   frame_texture->failed_image_path.clear();
+  frame_texture->orb_enabled_for_texture = compute_orb;
+  frame_texture->orb_max_features_for_texture = orb_max_features;
+  frame_texture->tracking_enabled_for_texture = compute_tracking;
   if (error_message != nullptr) {
     error_message->clear();
   }
@@ -224,10 +471,20 @@ int main(int argc, char** argv) {
 
   sense8::io::SensorSequence sequence;
   sense8::io::ReplayCursor cursor;
+  FrontendTrackingState tracking_state;
   try {
     const sense8::io::EurocDatasetLoader loader;
     sequence = loader.Load(dataset_path);
     cursor.Bind(&sequence.merged_packets);
+
+    std::string intrinsics_error;
+    if (LoadEurocIntrinsics(dataset_path, &tracking_state.camera_matrix, &intrinsics_error)) {
+      tracking_state.has_camera_intrinsics = true;
+      spdlog::info("Loaded cam0 intrinsics for Essential-matrix RANSAC");
+    } else {
+      tracking_state.has_camera_intrinsics = false;
+      spdlog::warn("{}", intrinsics_error);
+    }
   } catch (const std::exception& ex) {
     spdlog::error("Failed to load dataset: {}", ex.what());
     return EXIT_FAILURE;
@@ -259,6 +516,10 @@ int main(int argc, char** argv) {
   double previous_time_s = glfwGetTime();
   float timeline_ratio = 0.0F;
   float imu_window_seconds = 5.0F;
+  bool show_orb_features = true;
+  bool show_feature_tracks = true;
+  int orb_max_features = 500;
+  int max_rendered_tracks = 300;
   FrameTexture frame_texture;
   std::string frame_error;
 
@@ -304,9 +565,19 @@ int main(int argc, char** argv) {
         ImGui::Text("Current packet index: %zu", cursor.packet_index());
         ImGui::Text("Timestamp: %lld ns", static_cast<long long>(cursor.current_timestamp_ns()));
 
+        ImGui::Checkbox("Show ORB features", &show_orb_features);
+        ImGui::SameLine();
+        ImGui::Checkbox("Show feature tracks", &show_feature_tracks);
+        ImGui::SliderInt("ORB max features", &orb_max_features, 100, 2000);
+        ImGui::SliderInt("Max rendered tracks", &max_rendered_tracks, 50, 1000);
+
         const bool has_frame_texture = UpdateFrameTexture(
             sequence.camera_frames,
             cursor.current_timestamp_ns(),
+            show_orb_features,
+            orb_max_features,
+          show_feature_tracks,
+          &tracking_state,
             &frame_texture,
             &frame_error);
 
@@ -316,8 +587,111 @@ int main(int argc, char** argv) {
           const float aspect_ratio = static_cast<float>(frame_texture.height) / static_cast<float>(frame_texture.width);
           const float image_width = std::max(320.0F, available_width);
           const float image_height = image_width * aspect_ratio;
+          const ImVec2 image_top_left = ImGui::GetCursorScreenPos();
+          const ImVec2 image_bottom_right(image_top_left.x + image_width, image_top_left.y + image_height);
           ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(image_width, image_height));
+
+          if (show_feature_tracks && !tracking_state.inlier_tracks.empty()) {
+            const float scale_x = image_width / static_cast<float>(frame_texture.width);
+            const float scale_y = image_height / static_cast<float>(frame_texture.height);
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+            const std::size_t rendered_tracks = std::min(
+                tracking_state.inlier_tracks.size(),
+                static_cast<std::size_t>(std::max(1, max_rendered_tracks)));
+            for (std::size_t track_index = 0; track_index < rendered_tracks; ++track_index) {
+              const auto& track = tracking_state.inlier_tracks[track_index];
+              const ImVec2 previous_point(
+                  image_top_left.x + track.previous_point.x * scale_x,
+                  image_top_left.y + track.previous_point.y * scale_y);
+              const ImVec2 current_point(
+                  image_top_left.x + track.current_point.x * scale_x,
+                  image_top_left.y + track.current_point.y * scale_y);
+
+              if (current_point.x < image_top_left.x || current_point.x > image_bottom_right.x ||
+                  current_point.y < image_top_left.y || current_point.y > image_bottom_right.y) {
+                continue;
+              }
+
+              draw_list->AddLine(previous_point, current_point, IM_COL32(30, 170, 255, 200), 1.0F);
+              draw_list->AddCircleFilled(current_point, 2.2F, IM_COL32(255, 220, 30, 220), 6);
+            }
+          }
+
+          if (show_orb_features && !frame_texture.orb_keypoints.empty()) {
+            const float scale_x = image_width / static_cast<float>(frame_texture.width);
+            const float scale_y = image_height / static_cast<float>(frame_texture.height);
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+            int hovered_keypoint_index = -1;
+            float hovered_distance_sq = std::numeric_limits<float>::max();
+            const ImVec2 mouse_pos = ImGui::GetIO().MousePos;
+            const bool mouse_over_image = ImGui::IsMouseHoveringRect(image_top_left, image_bottom_right);
+
+            constexpr float kHoverRadiusPixels = 8.0F;
+            const float max_hover_distance_sq = kHoverRadiusPixels * kHoverRadiusPixels;
+
+            constexpr std::size_t kMaxRenderedOverlayPoints = 1000;
+            const std::size_t rendered_count = std::min(frame_texture.orb_keypoints.size(), kMaxRenderedOverlayPoints);
+
+            for (std::size_t keypoint_index = 0; keypoint_index < rendered_count; ++keypoint_index) {
+              const auto& keypoint = frame_texture.orb_keypoints[keypoint_index];
+              const ImVec2 point(
+                  image_top_left.x + keypoint.pt.x * scale_x,
+                  image_top_left.y + keypoint.pt.y * scale_y);
+              draw_list->AddCircleFilled(point, 3.0F, IM_COL32(60, 255, 60, 220), 6);
+
+              if (mouse_over_image) {
+                const float dx = mouse_pos.x - point.x;
+                const float dy = mouse_pos.y - point.y;
+                const float dist_sq = dx * dx + dy * dy;
+                if (dist_sq <= max_hover_distance_sq && dist_sq < hovered_distance_sq) {
+                  hovered_distance_sq = dist_sq;
+                  hovered_keypoint_index = static_cast<int>(keypoint_index);
+                }
+              }
+            }
+
+            if (hovered_keypoint_index >= 0) {
+              const auto& hovered_keypoint = frame_texture.orb_keypoints[static_cast<std::size_t>(hovered_keypoint_index)];
+              const float u_center = hovered_keypoint.pt.x / static_cast<float>(frame_texture.width);
+              const float v_center = hovered_keypoint.pt.y / static_cast<float>(frame_texture.height);
+              const float half_u = (15.0F * 0.5F) / static_cast<float>(frame_texture.width);
+              const float half_v = (15.0F * 0.5F) / static_cast<float>(frame_texture.height);
+
+              const ImVec2 uv0(std::clamp(u_center - half_u, 0.0F, 1.0F), std::clamp(v_center - half_v, 0.0F, 1.0F));
+              const ImVec2 uv1(std::clamp(u_center + half_u, 0.0F, 1.0F), std::clamp(v_center + half_v, 0.0F, 1.0F));
+
+              ImGui::BeginTooltip();
+              ImGui::Text("ORB feature #%d", hovered_keypoint_index);
+              ImGui::Text("x=%.1f, y=%.1f", hovered_keypoint.pt.x, hovered_keypoint.pt.y);
+              ImGui::Text("response=%.3f", hovered_keypoint.response);
+              ImGui::Separator();
+              ImGui::Text("15x15 patch (zoomed)");
+              ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(180.0F, 180.0F), uv0, uv1);
+              ImGui::EndTooltip();
+            }
+          }
+
           ImGui::TextWrapped("Image: %s", frame_texture.loaded_image_path.c_str());
+          ImGui::Text("ORB keypoints: %zu", frame_texture.orb_keypoints.size());
+          if (frame_texture.orb_keypoints.size() > 1000) {
+            ImGui::Text("Rendering first %d keypoints for UI stability", 1000);
+          }
+          ImGui::Text("ORB detect time: %.2f ms", frame_texture.orb_compute_ms);
+
+          ImGui::SeparatorText("Frontend Health");
+          ImGui::Text("Geometric model: %s", tracking_state.metrics.geometric_model.c_str());
+          ImGui::Text("Mutual matches: %d", tracking_state.metrics.mutual_matches);
+          ImGui::Text("RANSAC inliers: %d", tracking_state.metrics.inlier_matches);
+          const double inlier_ratio = tracking_state.metrics.mutual_matches > 0
+                                          ? static_cast<double>(tracking_state.metrics.inlier_matches) /
+                                                static_cast<double>(tracking_state.metrics.mutual_matches)
+                                          : 0.0;
+          ImGui::Text("Inlier ratio: %.3f", inlier_ratio);
+          ImGui::Text("Detect/compute: %.2f ms", tracking_state.metrics.detect_compute_ms);
+          ImGui::Text("Matching: %.2f ms", tracking_state.metrics.match_ms);
+          ImGui::Text("RANSAC: %.2f ms", tracking_state.metrics.ransac_ms);
         } else {
           ImGui::TextWrapped("%s", frame_error.c_str());
         }
