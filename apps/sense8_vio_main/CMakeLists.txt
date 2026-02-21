@@ -11,6 +11,7 @@ target_link_libraries(sense8_vio_main
   PRIVATE
     CLI11::CLI11
     ${OpenCV_LIBS}
+    sense8_io
     sense8_common
 )
 

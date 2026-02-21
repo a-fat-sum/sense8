@@ -2,6 +2,10 @@
 
 Monocular visual-inertial SLAM system in C++ with optional satellite matching mode.
 
+## Command line parsing
+
+The project uses **CLI11** as the C++ argument parser (`argparse`) library.
+
 ## Dependency management
 
 This repository uses **vcpkg manifest mode** (`vcpkg.json`) so dependencies are defined in-repo and restored automatically for local builds and CI.
@@ -37,6 +41,15 @@ ctest --preset ci --output-on-failure
 GitHub Actions workflow at `.github/workflows/ci.yml` builds and tests on:
 - `ubuntu-latest`
 - `windows-latest`
+
+## Optional Dear ImGui viewer
+
+Viewer target `sense8_viewer` is available behind `SENSE8_BUILD_VIEWER`.
+
+```powershell
+cmake --preset debug -DSENSE8_BUILD_VIEWER=ON
+cmake --build --preset debug --parallel
+```
 
 ## Current skeleton targets
 - `sense8_common` (core shared library)

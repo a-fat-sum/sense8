@@ -1,0 +1,5 @@
+#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]
+timestamp,w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]
+1000,0.1,0.0,-0.1,0.0,0.0,9.81
+3000,0.2,0.1,-0.2,0.1,0.0,9.80
+2000,0.15,0.05,-0.15,0.0,0.1,9.79

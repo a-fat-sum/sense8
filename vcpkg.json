@@ -6,7 +6,15 @@
     "cli11",
     "eigen3",
     "fmt",
+    "glfw3",
     "gtest",
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ]
+    },
     "opencv4",
     "spdlog",
     "yaml-cpp"
