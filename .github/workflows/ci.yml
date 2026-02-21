@@ -60,18 +60,16 @@ jobs:
             exit 1
           fi
           "${NINJA_BIN}" --version
-          cmake --preset ci-release -G Ninja -DCMAKE_MAKE_PROGRAM="${NINJA_BIN}" -DSENSE8_BUILD_VIEWER=ON
+          cmake --preset ci-release -G Ninja -DCMAKE_MAKE_PROGRAM="${NINJA_BIN}" -DSENSE8_BUILD_VIEWER=ON -DVCPKG_MANIFEST_FEATURES=viewer
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-          VCPKG_MANIFEST_FEATURES: viewer
           VCPKG_FORCE_SYSTEM_BINARIES: 1
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake --preset ci-release -DSENSE8_BUILD_VIEWER=ON
+        run: cmake --preset ci-release -DSENSE8_BUILD_VIEWER=ON -DVCPKG_MANIFEST_FEATURES=viewer
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
-          VCPKG_MANIFEST_FEATURES: viewer
 
       - name: Build
         run: cmake --build --preset ci-release --parallel
