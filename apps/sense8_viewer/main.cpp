@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <limits>
+#include <sstream>
 #include <set>
 #include <string>
 #include <variant>
@@ -547,6 +549,264 @@ void DrawImuPlots(const std::vector<sense8::io::ImuSample>& imu_samples, std::in
   }
 }
 
+std::vector<cv::Point3f> LoadEurocGroundTruthPositions(const std::filesystem::path& dataset_root) {
+  std::vector<cv::Point3f> positions;
+  const auto gt_csv = dataset_root / "mav0" / "state_groundtruth_estimate0" / "data.csv";
+  std::ifstream file(gt_csv);
+  if (!file.is_open()) {
+    return positions;
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+
+    std::stringstream ss(line);
+    std::array<std::string, 4> fields;
+    bool valid = true;
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+      if (!std::getline(ss, fields[index], ',')) {
+        valid = false;
+        break;
+      }
+    }
+
+    if (!valid) {
+      continue;
+    }
+
+    try {
+      const float px = std::stof(fields[1]);
+      const float py = std::stof(fields[2]);
+      const float pz = std::stof(fields[3]);
+      positions.emplace_back(px, py, pz);
+    } catch (const std::exception&) {
+      continue;
+    }
+  }
+
+  if (!positions.empty()) {
+    const cv::Point3f origin = positions.front();
+    for (auto& point : positions) {
+      point -= origin;
+    }
+  }
+
+  return positions;
+}
+
+std::vector<cv::Point3f> TriangulateDebugPoints(const FrontendTrackingState& tracking_state,
+                                                const std::vector<FrontendTrack>& tracks,
+                                                std::size_t max_points) {
+  std::vector<cv::Point3f> triangulated_points;
+  if (!tracking_state.has_camera_intrinsics || tracking_state.camera_matrix.empty() || tracks.size() < 8) {
+    return triangulated_points;
+  }
+
+  const std::size_t track_count = std::min(tracks.size(), max_points);
+  std::vector<cv::Point2f> previous_points;
+  std::vector<cv::Point2f> current_points;
+  previous_points.reserve(track_count);
+  current_points.reserve(track_count);
+  for (std::size_t index = 0; index < track_count; ++index) {
+    previous_points.push_back(tracks[index].previous_point);
+    current_points.push_back(tracks[index].current_point);
+  }
+
+  cv::Mat inlier_mask;
+  const cv::Mat essential = cv::findEssentialMat(
+      previous_points,
+      current_points,
+      tracking_state.camera_matrix,
+      cv::RANSAC,
+      0.999,
+      1.0,
+      inlier_mask);
+  if (essential.empty()) {
+    return triangulated_points;
+  }
+
+  cv::Mat rotation;
+  cv::Mat translation;
+  const int recovered = cv::recoverPose(
+      essential,
+      previous_points,
+      current_points,
+      tracking_state.camera_matrix,
+      rotation,
+      translation,
+      inlier_mask);
+  if (recovered < 8) {
+    return triangulated_points;
+  }
+
+  const cv::Mat projection_1 = tracking_state.camera_matrix * cv::Mat::eye(3, 4, CV_64F);
+  cv::Mat pose_2;
+  cv::hconcat(rotation, translation, pose_2);
+  const cv::Mat projection_2 = tracking_state.camera_matrix * pose_2;
+
+  cv::Mat homogeneous_points;
+  cv::triangulatePoints(projection_1, projection_2, previous_points, current_points, homogeneous_points);
+
+  triangulated_points.reserve(static_cast<std::size_t>(homogeneous_points.cols));
+  for (int column = 0; column < homogeneous_points.cols; ++column) {
+    if (!inlier_mask.empty() && inlier_mask.at<unsigned char>(column) == 0) {
+      continue;
+    }
+
+    const double w = homogeneous_points.at<double>(3, column);
+    if (std::abs(w) < 1e-9) {
+      continue;
+    }
+
+    const double x = homogeneous_points.at<double>(0, column) / w;
+    const double y = homogeneous_points.at<double>(1, column) / w;
+    const double z = homogeneous_points.at<double>(2, column) / w;
+    if (z <= 0.0 || z > 200.0) {
+      continue;
+    }
+
+    triangulated_points.emplace_back(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+  }
+
+  return triangulated_points;
+}
+
+bool ProjectWorldPoint(const cv::Point3f& point_world,
+                       const cv::Point3f& camera_position,
+                       const cv::Vec3f& basis_right,
+                       const cv::Vec3f& basis_up,
+                       const cv::Vec3f& basis_forward,
+                       const ImVec2& canvas_center,
+                       float focal_pixels,
+                       ImVec2* projected_point) {
+  const cv::Vec3f point_vector(point_world.x, point_world.y, point_world.z);
+  const cv::Vec3f camera_vector(camera_position.x, camera_position.y, camera_position.z);
+  const cv::Vec3f relative = point_vector - camera_vector;
+
+  const float view_x = relative.dot(basis_right);
+  const float view_y = relative.dot(basis_up);
+  const float view_z = relative.dot(basis_forward);
+  if (view_z <= 0.01F) {
+    return false;
+  }
+
+  projected_point->x = canvas_center.x + (view_x / view_z) * focal_pixels;
+  projected_point->y = canvas_center.y - (view_y / view_z) * focal_pixels;
+  return true;
+}
+
+void DrawSimple3DScene(const std::vector<cv::Point3f>& gt_trajectory,
+                       const std::vector<cv::Point3f>& triangulated_points,
+                       float* orbit_yaw_rad,
+                       float* orbit_pitch_rad,
+                       float* orbit_distance,
+                       cv::Point3f* orbit_target,
+                       bool show_gt,
+                       bool show_triangulated) {
+  ImVec2 canvas_size = ImGui::GetContentRegionAvail();
+  canvas_size.x = std::max(canvas_size.x, 320.0F);
+  canvas_size.y = std::max(canvas_size.y, 260.0F);
+
+  const ImVec2 canvas_min = ImGui::GetCursorScreenPos();
+  const ImVec2 canvas_max(canvas_min.x + canvas_size.x, canvas_min.y + canvas_size.y);
+  ImGui::InvisibleButton("3d_canvas", canvas_size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
+  const bool hovered = ImGui::IsItemHovered();
+
+  ImDrawList* draw_list = ImGui::GetWindowDrawList();
+  draw_list->AddRectFilled(canvas_min, canvas_max, IM_COL32(18, 18, 24, 255), 4.0F);
+  draw_list->AddRect(canvas_min, canvas_max, IM_COL32(80, 80, 95, 255), 4.0F);
+
+  ImGuiIO& io = ImGui::GetIO();
+  if (hovered) {
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+      *orbit_yaw_rad += io.MouseDelta.x * 0.01F;
+      *orbit_pitch_rad -= io.MouseDelta.y * 0.01F;
+      *orbit_pitch_rad = std::clamp(*orbit_pitch_rad, -1.45F, 1.45F);
+    }
+    if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+      orbit_target->x -= io.MouseDelta.x * 0.01F * (*orbit_distance);
+      orbit_target->y += io.MouseDelta.y * 0.01F * (*orbit_distance);
+    }
+    if (io.MouseWheel != 0.0F) {
+      *orbit_distance *= std::exp(-io.MouseWheel * 0.12F);
+      *orbit_distance = std::clamp(*orbit_distance, 1.0F, 200.0F);
+    }
+  }
+
+  const cv::Vec3f world_up(0.0F, 0.0F, 1.0F);
+  const cv::Vec3f forward(
+      std::cos(*orbit_pitch_rad) * std::cos(*orbit_yaw_rad),
+      std::cos(*orbit_pitch_rad) * std::sin(*orbit_yaw_rad),
+      std::sin(*orbit_pitch_rad));
+
+  const cv::Vec3f camera_direction = cv::normalize(forward);
+  const cv::Point3f camera_position(
+      orbit_target->x - camera_direction[0] * (*orbit_distance),
+      orbit_target->y - camera_direction[1] * (*orbit_distance),
+      orbit_target->z - camera_direction[2] * (*orbit_distance));
+
+  cv::Vec3f basis_forward = cv::normalize(cv::Vec3f(
+      orbit_target->x - camera_position.x,
+      orbit_target->y - camera_position.y,
+      orbit_target->z - camera_position.z));
+  cv::Vec3f basis_right = basis_forward.cross(world_up);
+  if (cv::norm(basis_right) < 1e-5F) {
+    basis_right = cv::Vec3f(1.0F, 0.0F, 0.0F);
+  } else {
+    basis_right = cv::normalize(basis_right);
+  }
+  cv::Vec3f basis_up = cv::normalize(basis_right.cross(basis_forward));
+
+  const ImVec2 canvas_center((canvas_min.x + canvas_max.x) * 0.5F, (canvas_min.y + canvas_max.y) * 0.5F);
+  const float focal_pixels = 0.75F * std::min(canvas_size.x, canvas_size.y);
+
+  auto draw_axis = [&](const cv::Point3f& start, const cv::Point3f& end, ImU32 color) {
+    ImVec2 start_2d;
+    ImVec2 end_2d;
+    if (!ProjectWorldPoint(start, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &start_2d)) {
+      return;
+    }
+    if (!ProjectWorldPoint(end, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &end_2d)) {
+      return;
+    }
+    draw_list->AddLine(start_2d, end_2d, color, 2.0F);
+  };
+
+  draw_axis(cv::Point3f(0.0F, 0.0F, 0.0F), cv::Point3f(1.0F, 0.0F, 0.0F), IM_COL32(255, 70, 70, 255));
+  draw_axis(cv::Point3f(0.0F, 0.0F, 0.0F), cv::Point3f(0.0F, 1.0F, 0.0F), IM_COL32(80, 255, 80, 255));
+  draw_axis(cv::Point3f(0.0F, 0.0F, 0.0F), cv::Point3f(0.0F, 0.0F, 1.0F), IM_COL32(80, 160, 255, 255));
+
+  if (show_gt && gt_trajectory.size() >= 2) {
+    ImVec2 previous;
+    bool has_previous = false;
+    for (const auto& point : gt_trajectory) {
+      ImVec2 projected;
+      if (!ProjectWorldPoint(point, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &projected)) {
+        has_previous = false;
+        continue;
+      }
+      if (has_previous) {
+        draw_list->AddLine(previous, projected, IM_COL32(120, 220, 255, 230), 2.0F);
+      }
+      previous = projected;
+      has_previous = true;
+    }
+  }
+
+  if (show_triangulated) {
+    for (const auto& point : triangulated_points) {
+      ImVec2 projected;
+      if (!ProjectWorldPoint(point, camera_position, basis_right, basis_up, basis_forward, canvas_center, focal_pixels, &projected)) {
+        continue;
+      }
+      draw_list->AddCircleFilled(projected, 2.0F, IM_COL32(255, 220, 80, 220), 6);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -559,10 +819,12 @@ int main(int argc, char** argv) {
   sense8::io::SensorSequence sequence;
   sense8::io::ReplayCursor cursor;
   FrontendTrackingState tracking_state;
+  std::vector<cv::Point3f> gt_positions_world;
   try {
     const sense8::io::EurocDatasetLoader loader;
     sequence = loader.Load(dataset_path);
     cursor.Bind(&sequence.merged_packets);
+    gt_positions_world = LoadEurocGroundTruthPositions(dataset_path);
 
     std::string intrinsics_error;
     if (LoadEurocIntrinsics(dataset_path, &tracking_state.camera_matrix, &intrinsics_error)) {
@@ -622,6 +884,14 @@ int main(int argc, char** argv) {
   std::vector<FrontendTrack> stable_inlier_tracks;
   std::vector<cv::KeyPoint> stable_previous_keypoints;
   std::vector<cv::KeyPoint> stable_current_keypoints;
+  std::vector<cv::Point3f> stable_triangulated_points;
+
+  bool show_gt_trajectory_3d = true;
+  bool show_triangulated_points_3d = true;
+  float orbit_yaw_rad = 0.3F;
+  float orbit_pitch_rad = 0.4F;
+  float orbit_distance = 8.0F;
+  cv::Point3f orbit_target(0.0F, 0.0F, 0.0F);
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -690,6 +960,7 @@ int main(int argc, char** argv) {
           stable_inlier_tracks = tracking_state.inlier_tracks;
           stable_previous_keypoints = tracking_state.match_previous_keypoints;
           stable_current_keypoints = tracking_state.match_current_keypoints;
+          stable_triangulated_points = TriangulateDebugPoints(tracking_state, stable_inlier_tracks, 400);
         }
 
         ImGui::SeparatorText("Camera View");
@@ -1043,6 +1314,28 @@ int main(int argc, char** argv) {
       if (ImGui::BeginTabItem("IMU Plots")) {
         ImGui::SliderFloat("Window (s)", &imu_window_seconds, 0.5F, 30.0F, "%.1f s");
         DrawImuPlots(sequence.imu_samples, cursor.current_timestamp_ns(), imu_window_seconds);
+        ImGui::EndTabItem();
+      }
+
+      if (ImGui::BeginTabItem("3D View")) {
+        ImGui::Text("Visualization-first scaffold (GT + debug triangulation)");
+        ImGui::Checkbox("Show GT trajectory", &show_gt_trajectory_3d);
+        ImGui::SameLine();
+        ImGui::Checkbox("Show triangulated points", &show_triangulated_points_3d);
+        ImGui::Text("GT samples: %zu", gt_positions_world.size());
+        ImGui::Text("Triangulated points: %zu", stable_triangulated_points.size());
+        ImGui::Text("Controls: Right-drag orbit, Middle-drag pan, Mouse wheel zoom");
+
+        DrawSimple3DScene(
+            gt_positions_world,
+            stable_triangulated_points,
+            &orbit_yaw_rad,
+            &orbit_pitch_rad,
+            &orbit_distance,
+            &orbit_target,
+            show_gt_trajectory_3d,
+            show_triangulated_points_3d);
+
         ImGui::EndTabItem();
       }
 
