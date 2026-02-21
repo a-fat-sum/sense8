@@ -65,10 +65,16 @@ struct FrontendTrackingState {
   std::vector<cv::KeyPoint> previous_keypoints;
   cv::Mat previous_descriptors;
   std::size_t previous_camera_index = 0;
+  std::string previous_image_path;
   bool has_previous_frame = false;
 
   std::vector<FrontendTrack> inlier_tracks;
   FrontendMetrics metrics;
+  std::string match_previous_image_path;
+  std::string match_current_image_path;
+  std::vector<cv::KeyPoint> match_previous_keypoints;
+  std::vector<cv::KeyPoint> match_current_keypoints;
+  bool has_match_pair = false;
 
   cv::Mat camera_matrix;
   bool has_camera_intrinsics = false;
@@ -154,23 +160,36 @@ void ResetTrackingState(FrontendTrackingState* tracking_state) {
   tracking_state->previous_keypoints.clear();
   tracking_state->previous_descriptors.release();
   tracking_state->previous_camera_index = 0;
+  tracking_state->previous_image_path.clear();
   tracking_state->has_previous_frame = false;
   tracking_state->inlier_tracks.clear();
   tracking_state->metrics = FrontendMetrics{};
+  tracking_state->match_previous_image_path.clear();
+  tracking_state->match_current_image_path.clear();
+  tracking_state->match_previous_keypoints.clear();
+  tracking_state->match_current_keypoints.clear();
+  tracking_state->has_match_pair = false;
 }
 
 void UpdateTracking(const std::vector<cv::KeyPoint>& current_keypoints,
                     const cv::Mat& current_descriptors,
                     std::size_t camera_index,
+                    const std::string& current_image_path,
                     FrontendTrackingState* tracking_state) {
   tracking_state->inlier_tracks.clear();
   tracking_state->metrics = FrontendMetrics{};
   tracking_state->metrics.keypoints_current = static_cast<int>(current_keypoints.size());
+  tracking_state->has_match_pair = false;
+  tracking_state->match_previous_image_path.clear();
+  tracking_state->match_current_image_path.clear();
+  tracking_state->match_previous_keypoints.clear();
+  tracking_state->match_current_keypoints.clear();
 
   if (current_descriptors.empty() || current_keypoints.empty()) {
     tracking_state->previous_keypoints = current_keypoints;
     tracking_state->previous_descriptors = current_descriptors.clone();
     tracking_state->previous_camera_index = camera_index;
+    tracking_state->previous_image_path = current_image_path;
     tracking_state->has_previous_frame = true;
     return;
   }
@@ -181,9 +200,16 @@ void UpdateTracking(const std::vector<cv::KeyPoint>& current_keypoints,
     tracking_state->previous_keypoints = current_keypoints;
     tracking_state->previous_descriptors = current_descriptors.clone();
     tracking_state->previous_camera_index = camera_index;
+    tracking_state->previous_image_path = current_image_path;
     tracking_state->has_previous_frame = true;
     return;
   }
+
+  tracking_state->match_previous_image_path = tracking_state->previous_image_path;
+  tracking_state->match_current_image_path = current_image_path;
+  tracking_state->match_previous_keypoints = tracking_state->previous_keypoints;
+  tracking_state->match_current_keypoints = current_keypoints;
+  tracking_state->has_match_pair = true;
 
   const auto match_start = std::chrono::steady_clock::now();
   const std::vector<cv::DMatch> mutual_matches = ComputeMutualRatioMatches(
@@ -232,6 +258,7 @@ void UpdateTracking(const std::vector<cv::KeyPoint>& current_keypoints,
   tracking_state->previous_keypoints = current_keypoints;
   tracking_state->previous_descriptors = current_descriptors.clone();
   tracking_state->previous_camera_index = camera_index;
+  tracking_state->previous_image_path = current_image_path;
   tracking_state->has_previous_frame = true;
 }
 
@@ -262,6 +289,66 @@ void DestroyTexture(FrameTexture* frame_texture) {
   frame_texture->orb_compute_ms = 0.0;
   frame_texture->orb_enabled_for_texture = false;
   frame_texture->orb_max_features_for_texture = 0;
+}
+
+bool UpdateTextureFromImagePath(const std::string& image_path,
+                                FrameTexture* frame_texture,
+                                std::string* error_message) {
+  if (image_path.empty()) {
+    if (error_message != nullptr) {
+      *error_message = "Image path is empty";
+    }
+    return false;
+  }
+
+  if (frame_texture->loaded_image_path == image_path && frame_texture->texture_id != 0) {
+    return true;
+  }
+
+  if (frame_texture->failed_image_path == image_path) {
+    if (error_message != nullptr) {
+      *error_message = std::string("Failed to read image: ") + image_path;
+    }
+    return false;
+  }
+
+  const cv::Mat bgr_image = cv::imread(image_path, cv::IMREAD_COLOR);
+  if (bgr_image.empty()) {
+    frame_texture->failed_image_path = image_path;
+    if (error_message != nullptr) {
+      *error_message = std::string("Failed to read image: ") + image_path;
+    }
+    return false;
+  }
+
+  cv::Mat rgba_image;
+  cv::cvtColor(bgr_image, rgba_image, cv::COLOR_BGR2RGBA);
+
+  EnsureTexture(frame_texture);
+  glBindTexture(GL_TEXTURE_2D, frame_texture->texture_id);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(
+      GL_TEXTURE_2D,
+      0,
+      GL_RGBA,
+      rgba_image.cols,
+      rgba_image.rows,
+      0,
+      GL_RGBA,
+      GL_UNSIGNED_BYTE,
+      rgba_image.data);
+  glBindTexture(GL_TEXTURE_2D, 0);
+
+  frame_texture->width = rgba_image.cols;
+  frame_texture->height = rgba_image.rows;
+  frame_texture->loaded_image_path = image_path;
+  frame_texture->failed_image_path.clear();
+
+  if (error_message != nullptr) {
+    error_message->clear();
+  }
+
+  return true;
 }
 
 void ComputeOrbFeatures(const cv::Mat& bgr_image,
@@ -350,7 +437,7 @@ bool UpdateFrameTexture(const std::vector<sense8::io::CameraFrame>& camera_frame
   }
 
   if (compute_tracking && tracking_state != nullptr) {
-    UpdateTracking(detected_keypoints, detected_descriptors, camera_index, tracking_state);
+    UpdateTracking(detected_keypoints, detected_descriptors, camera_index, image_path, tracking_state);
     tracking_state->metrics.detect_compute_ms = frame_texture->orb_compute_ms;
   } else if (tracking_state != nullptr) {
     ResetTrackingState(tracking_state);
@@ -510,18 +597,31 @@ int main(int argc, char** argv) {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
   ImGui::StyleColorsDark();
+  ImGui::GetIO().FontGlobalScale = 1.3F;
   ImGui_ImplGlfw_InitForOpenGL(window, true);
   ImGui_ImplOpenGL3_Init(glsl_version);
 
   double previous_time_s = glfwGetTime();
   float timeline_ratio = 0.0F;
+  float ui_font_scale = 1.3F;
   float imu_window_seconds = 5.0F;
   bool show_orb_features = true;
   bool show_feature_tracks = true;
   int orb_max_features = 500;
   int max_rendered_tracks = 300;
   FrameTexture frame_texture;
+  FrameTexture previous_frame_texture;
+  FrameTexture dual_current_frame_texture;
   std::string frame_error;
+  std::string previous_frame_error;
+  std::string dual_current_frame_error;
+
+  bool has_stable_match_pair = false;
+  std::string stable_previous_image_path;
+  std::string stable_current_image_path;
+  std::vector<FrontendTrack> stable_inlier_tracks;
+  std::vector<cv::KeyPoint> stable_previous_keypoints;
+  std::vector<cv::KeyPoint> stable_current_keypoints;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -535,6 +635,7 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+    ImGui::GetIO().FontGlobalScale = ui_font_scale;
 
     ImGui::Begin("sense8 replay");
     if (ImGui::BeginTabBar("top_tabs")) {
@@ -565,6 +666,7 @@ int main(int argc, char** argv) {
         ImGui::Text("Current packet index: %zu", cursor.packet_index());
         ImGui::Text("Timestamp: %lld ns", static_cast<long long>(cursor.current_timestamp_ns()));
 
+        ImGui::SliderFloat("UI Font Scale", &ui_font_scale, 1.0F, 2.0F, "%.2f");
         ImGui::Checkbox("Show ORB features", &show_orb_features);
         ImGui::SameLine();
         ImGui::Checkbox("Show feature tracks", &show_feature_tracks);
@@ -581,99 +683,329 @@ int main(int argc, char** argv) {
             &frame_texture,
             &frame_error);
 
+        if (has_frame_texture && tracking_state.has_match_pair) {
+          has_stable_match_pair = true;
+          stable_previous_image_path = tracking_state.match_previous_image_path;
+          stable_current_image_path = tracking_state.match_current_image_path;
+          stable_inlier_tracks = tracking_state.inlier_tracks;
+          stable_previous_keypoints = tracking_state.match_previous_keypoints;
+          stable_current_keypoints = tracking_state.match_current_keypoints;
+        }
+
         ImGui::SeparatorText("Camera View");
         if (has_frame_texture) {
           const float available_width = ImGui::GetContentRegionAvail().x;
-          const float aspect_ratio = static_cast<float>(frame_texture.height) / static_cast<float>(frame_texture.width);
-          const float image_width = std::max(320.0F, available_width);
-          const float image_height = image_width * aspect_ratio;
-          const ImVec2 image_top_left = ImGui::GetCursorScreenPos();
-          const ImVec2 image_bottom_right(image_top_left.x + image_width, image_top_left.y + image_height);
-          ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(image_width, image_height));
+          if (ImGui::BeginTabBar("replay_view_tabs")) {
+            if (ImGui::BeginTabItem("Single View")) {
+              const float aspect_ratio = static_cast<float>(frame_texture.height) / static_cast<float>(frame_texture.width);
+              const float image_width = std::max(320.0F, available_width);
+              const float image_height = image_width * aspect_ratio;
+              const ImVec2 image_top_left = ImGui::GetCursorScreenPos();
+              const ImVec2 image_bottom_right(image_top_left.x + image_width, image_top_left.y + image_height);
+              ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(image_width, image_height));
 
-          if (show_feature_tracks && !tracking_state.inlier_tracks.empty()) {
-            const float scale_x = image_width / static_cast<float>(frame_texture.width);
-            const float scale_y = image_height / static_cast<float>(frame_texture.height);
-            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+              if (show_feature_tracks && !tracking_state.inlier_tracks.empty()) {
+                const float scale_x = image_width / static_cast<float>(frame_texture.width);
+                const float scale_y = image_height / static_cast<float>(frame_texture.height);
+                ImDrawList* draw_list = ImGui::GetWindowDrawList();
 
-            const std::size_t rendered_tracks = std::min(
-                tracking_state.inlier_tracks.size(),
-                static_cast<std::size_t>(std::max(1, max_rendered_tracks)));
-            for (std::size_t track_index = 0; track_index < rendered_tracks; ++track_index) {
-              const auto& track = tracking_state.inlier_tracks[track_index];
-              const ImVec2 previous_point(
-                  image_top_left.x + track.previous_point.x * scale_x,
-                  image_top_left.y + track.previous_point.y * scale_y);
-              const ImVec2 current_point(
-                  image_top_left.x + track.current_point.x * scale_x,
-                  image_top_left.y + track.current_point.y * scale_y);
+                const std::size_t rendered_tracks = std::min(
+                    tracking_state.inlier_tracks.size(),
+                    static_cast<std::size_t>(std::max(1, max_rendered_tracks)));
+                for (std::size_t track_index = 0; track_index < rendered_tracks; ++track_index) {
+                  const auto& track = tracking_state.inlier_tracks[track_index];
+                  const ImVec2 previous_point(
+                      image_top_left.x + track.previous_point.x * scale_x,
+                      image_top_left.y + track.previous_point.y * scale_y);
+                  const ImVec2 current_point(
+                      image_top_left.x + track.current_point.x * scale_x,
+                      image_top_left.y + track.current_point.y * scale_y);
 
-              if (current_point.x < image_top_left.x || current_point.x > image_bottom_right.x ||
-                  current_point.y < image_top_left.y || current_point.y > image_bottom_right.y) {
-                continue;
-              }
+                  if (current_point.x < image_top_left.x || current_point.x > image_bottom_right.x ||
+                      current_point.y < image_top_left.y || current_point.y > image_bottom_right.y) {
+                    continue;
+                  }
 
-              draw_list->AddLine(previous_point, current_point, IM_COL32(30, 170, 255, 200), 1.0F);
-              draw_list->AddCircleFilled(current_point, 2.2F, IM_COL32(255, 220, 30, 220), 6);
-            }
-          }
-
-          if (show_orb_features && !frame_texture.orb_keypoints.empty()) {
-            const float scale_x = image_width / static_cast<float>(frame_texture.width);
-            const float scale_y = image_height / static_cast<float>(frame_texture.height);
-            ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-            int hovered_keypoint_index = -1;
-            float hovered_distance_sq = std::numeric_limits<float>::max();
-            const ImVec2 mouse_pos = ImGui::GetIO().MousePos;
-            const bool mouse_over_image = ImGui::IsMouseHoveringRect(image_top_left, image_bottom_right);
-
-            constexpr float kHoverRadiusPixels = 8.0F;
-            const float max_hover_distance_sq = kHoverRadiusPixels * kHoverRadiusPixels;
-
-            constexpr std::size_t kMaxRenderedOverlayPoints = 1000;
-            const std::size_t rendered_count = std::min(frame_texture.orb_keypoints.size(), kMaxRenderedOverlayPoints);
-
-            for (std::size_t keypoint_index = 0; keypoint_index < rendered_count; ++keypoint_index) {
-              const auto& keypoint = frame_texture.orb_keypoints[keypoint_index];
-              const ImVec2 point(
-                  image_top_left.x + keypoint.pt.x * scale_x,
-                  image_top_left.y + keypoint.pt.y * scale_y);
-              draw_list->AddCircleFilled(point, 3.0F, IM_COL32(60, 255, 60, 220), 6);
-
-              if (mouse_over_image) {
-                const float dx = mouse_pos.x - point.x;
-                const float dy = mouse_pos.y - point.y;
-                const float dist_sq = dx * dx + dy * dy;
-                if (dist_sq <= max_hover_distance_sq && dist_sq < hovered_distance_sq) {
-                  hovered_distance_sq = dist_sq;
-                  hovered_keypoint_index = static_cast<int>(keypoint_index);
+                  draw_list->AddLine(previous_point, current_point, IM_COL32(230, 50, 50, 230), 1.8F);
+                  draw_list->AddCircleFilled(current_point, 2.2F, IM_COL32(255, 220, 30, 220), 6);
                 }
               }
+
+              if (show_orb_features && !frame_texture.orb_keypoints.empty()) {
+                const float scale_x = image_width / static_cast<float>(frame_texture.width);
+                const float scale_y = image_height / static_cast<float>(frame_texture.height);
+                ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+                int hovered_keypoint_index = -1;
+                float hovered_distance_sq = std::numeric_limits<float>::max();
+                const ImVec2 mouse_pos = ImGui::GetIO().MousePos;
+                const bool mouse_over_image = ImGui::IsMouseHoveringRect(image_top_left, image_bottom_right);
+
+                constexpr float kHoverRadiusPixels = 8.0F;
+                const float max_hover_distance_sq = kHoverRadiusPixels * kHoverRadiusPixels;
+
+                constexpr std::size_t kMaxRenderedOverlayPoints = 1000;
+                const std::size_t rendered_count = std::min(frame_texture.orb_keypoints.size(), kMaxRenderedOverlayPoints);
+
+                for (std::size_t keypoint_index = 0; keypoint_index < rendered_count; ++keypoint_index) {
+                  const auto& keypoint = frame_texture.orb_keypoints[keypoint_index];
+                  const ImVec2 point(
+                      image_top_left.x + keypoint.pt.x * scale_x,
+                      image_top_left.y + keypoint.pt.y * scale_y);
+                  draw_list->AddCircleFilled(point, 3.0F, IM_COL32(60, 255, 60, 220), 6);
+
+                  if (mouse_over_image) {
+                    const float dx = mouse_pos.x - point.x;
+                    const float dy = mouse_pos.y - point.y;
+                    const float dist_sq = dx * dx + dy * dy;
+                    if (dist_sq <= max_hover_distance_sq && dist_sq < hovered_distance_sq) {
+                      hovered_distance_sq = dist_sq;
+                      hovered_keypoint_index = static_cast<int>(keypoint_index);
+                    }
+                  }
+                }
+
+                if (hovered_keypoint_index >= 0) {
+                  const auto& hovered_keypoint = frame_texture.orb_keypoints[static_cast<std::size_t>(hovered_keypoint_index)];
+                  const float u_center = hovered_keypoint.pt.x / static_cast<float>(frame_texture.width);
+                  const float v_center = hovered_keypoint.pt.y / static_cast<float>(frame_texture.height);
+                  const float half_u = (15.0F * 0.5F) / static_cast<float>(frame_texture.width);
+                  const float half_v = (15.0F * 0.5F) / static_cast<float>(frame_texture.height);
+
+                  const ImVec2 uv0(std::clamp(u_center - half_u, 0.0F, 1.0F), std::clamp(v_center - half_v, 0.0F, 1.0F));
+                  const ImVec2 uv1(std::clamp(u_center + half_u, 0.0F, 1.0F), std::clamp(v_center + half_v, 0.0F, 1.0F));
+
+                  ImGui::BeginTooltip();
+                  ImGui::Text("ORB feature #%d", hovered_keypoint_index);
+                  ImGui::Text("x=%.1f, y=%.1f", hovered_keypoint.pt.x, hovered_keypoint.pt.y);
+                  ImGui::Text("response=%.3f", hovered_keypoint.response);
+                  ImGui::Separator();
+                  ImGui::Text("15x15 patch (zoomed)");
+                  ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(180.0F, 180.0F), uv0, uv1);
+                  const ImVec2 patch_min = ImGui::GetItemRectMin();
+                  const ImVec2 patch_max = ImGui::GetItemRectMax();
+                  const ImVec2 patch_center((patch_min.x + patch_max.x) * 0.5F, (patch_min.y + patch_max.y) * 0.5F);
+                  ImDrawList* tooltip_draw_list = ImGui::GetWindowDrawList();
+                  tooltip_draw_list->AddLine(
+                      ImVec2(patch_center.x - 8.0F, patch_center.y - 8.0F),
+                      ImVec2(patch_center.x + 8.0F, patch_center.y + 8.0F),
+                      IM_COL32(255, 80, 80, 255),
+                      2.0F);
+                  tooltip_draw_list->AddLine(
+                      ImVec2(patch_center.x - 8.0F, patch_center.y + 8.0F),
+                      ImVec2(patch_center.x + 8.0F, patch_center.y - 8.0F),
+                      IM_COL32(255, 80, 80, 255),
+                      2.0F);
+                  ImGui::EndTooltip();
+                }
+              }
+
+              ImGui::TextWrapped("Image: %s", frame_texture.loaded_image_path.c_str());
+              ImGui::EndTabItem();
             }
 
-            if (hovered_keypoint_index >= 0) {
-              const auto& hovered_keypoint = frame_texture.orb_keypoints[static_cast<std::size_t>(hovered_keypoint_index)];
-              const float u_center = hovered_keypoint.pt.x / static_cast<float>(frame_texture.width);
-              const float v_center = hovered_keypoint.pt.y / static_cast<float>(frame_texture.height);
-              const float half_u = (15.0F * 0.5F) / static_cast<float>(frame_texture.width);
-              const float half_v = (15.0F * 0.5F) / static_cast<float>(frame_texture.height);
+            if (ImGui::BeginTabItem("Dual View")) {
+              if (!has_stable_match_pair) {
+                ImGui::Text("Need consecutive frames for dual-view correspondence");
+              } else {
+                const bool has_previous_texture = UpdateTextureFromImagePath(
+                    stable_previous_image_path,
+                    &previous_frame_texture,
+                    &previous_frame_error);
+                const bool has_current_texture = UpdateTextureFromImagePath(
+                    stable_current_image_path,
+                    &dual_current_frame_texture,
+                    &dual_current_frame_error);
 
-              const ImVec2 uv0(std::clamp(u_center - half_u, 0.0F, 1.0F), std::clamp(v_center - half_v, 0.0F, 1.0F));
-              const ImVec2 uv1(std::clamp(u_center + half_u, 0.0F, 1.0F), std::clamp(v_center + half_v, 0.0F, 1.0F));
+                if (has_previous_texture && has_current_texture) {
+                  const float image_gap = 16.0F;
+                  const float pane_width = std::max(260.0F, (available_width - image_gap) * 0.5F);
+                  const float previous_aspect = static_cast<float>(previous_frame_texture.height) /
+                                                static_cast<float>(previous_frame_texture.width);
+                  const float current_aspect = static_cast<float>(dual_current_frame_texture.height) /
+                                               static_cast<float>(dual_current_frame_texture.width);
+                  const float previous_height = pane_width * previous_aspect;
+                  const float current_height = pane_width * current_aspect;
+                  const float pane_height = std::max(previous_height, current_height);
 
-              ImGui::BeginTooltip();
-              ImGui::Text("ORB feature #%d", hovered_keypoint_index);
-              ImGui::Text("x=%.1f, y=%.1f", hovered_keypoint.pt.x, hovered_keypoint.pt.y);
-              ImGui::Text("response=%.3f", hovered_keypoint.response);
-              ImGui::Separator();
-              ImGui::Text("15x15 patch (zoomed)");
-              ImGui::Image((ImTextureID)(intptr_t)frame_texture.texture_id, ImVec2(180.0F, 180.0F), uv0, uv1);
-              ImGui::EndTooltip();
+                  const ImVec2 previous_top_left = ImGui::GetCursorScreenPos();
+                  ImGui::Image((ImTextureID)(intptr_t)previous_frame_texture.texture_id, ImVec2(pane_width, previous_height));
+
+                  ImGui::SameLine(0.0F, image_gap);
+                  const ImVec2 current_top_left = ImGui::GetCursorScreenPos();
+                  ImGui::Image((ImTextureID)(intptr_t)dual_current_frame_texture.texture_id, ImVec2(pane_width, current_height));
+
+                  const ImVec2 previous_bottom_right(previous_top_left.x + pane_width, previous_top_left.y + previous_height);
+                  const ImVec2 current_bottom_right(current_top_left.x + pane_width, current_top_left.y + current_height);
+
+                  if (show_feature_tracks && !stable_inlier_tracks.empty()) {
+                    const float prev_scale_x = pane_width / static_cast<float>(previous_frame_texture.width);
+                    const float prev_scale_y = previous_height / static_cast<float>(previous_frame_texture.height);
+                    const float curr_scale_x = pane_width / static_cast<float>(dual_current_frame_texture.width);
+                    const float curr_scale_y = current_height / static_cast<float>(dual_current_frame_texture.height);
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+                    const std::size_t rendered_tracks = std::min(
+                        stable_inlier_tracks.size(),
+                        static_cast<std::size_t>(std::max(1, max_rendered_tracks)));
+                    for (std::size_t track_index = 0; track_index < rendered_tracks; ++track_index) {
+                      const auto& track = stable_inlier_tracks[track_index];
+                      const ImVec2 previous_point(
+                          previous_top_left.x + track.previous_point.x * prev_scale_x,
+                          previous_top_left.y + track.previous_point.y * prev_scale_y);
+                      const ImVec2 current_point(
+                          current_top_left.x + track.current_point.x * curr_scale_x,
+                          current_top_left.y + track.current_point.y * curr_scale_y);
+
+                      draw_list->AddLine(previous_point, current_point, IM_COL32(30, 170, 255, 200), 1.0F);
+                      draw_list->AddCircleFilled(previous_point, 2.0F, IM_COL32(255, 220, 30, 220), 6);
+                      draw_list->AddCircleFilled(current_point, 2.0F, IM_COL32(255, 220, 30, 220), 6);
+                    }
+                  }
+
+                  if (show_orb_features) {
+                    const float prev_scale_x = pane_width / static_cast<float>(previous_frame_texture.width);
+                    const float prev_scale_y = previous_height / static_cast<float>(previous_frame_texture.height);
+                    const float curr_scale_x = pane_width / static_cast<float>(dual_current_frame_texture.width);
+                    const float scale_y = current_height / static_cast<float>(dual_current_frame_texture.height);
+                    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+
+                    int hovered_prev_index = -1;
+                    int hovered_curr_index = -1;
+                    float hovered_prev_distance_sq = std::numeric_limits<float>::max();
+                    float hovered_curr_distance_sq = std::numeric_limits<float>::max();
+                    const ImVec2 mouse_pos = ImGui::GetIO().MousePos;
+                    const bool mouse_over_previous = ImGui::IsMouseHoveringRect(previous_top_left, previous_bottom_right);
+                    const bool mouse_over_image = ImGui::IsMouseHoveringRect(current_top_left, current_bottom_right);
+
+                    constexpr float kHoverRadiusPixels = 8.0F;
+                    const float max_hover_distance_sq = kHoverRadiusPixels * kHoverRadiusPixels;
+
+                    constexpr std::size_t kMaxRenderedOverlayPoints = 1000;
+                    const std::size_t rendered_prev = std::min(stable_previous_keypoints.size(), kMaxRenderedOverlayPoints);
+                    const std::size_t rendered_curr = std::min(stable_current_keypoints.size(), kMaxRenderedOverlayPoints);
+
+                    for (std::size_t keypoint_index = 0; keypoint_index < rendered_prev; ++keypoint_index) {
+                      const auto& keypoint = stable_previous_keypoints[keypoint_index];
+                      const ImVec2 point(
+                          previous_top_left.x + keypoint.pt.x * prev_scale_x,
+                          previous_top_left.y + keypoint.pt.y * prev_scale_y);
+                      draw_list->AddCircleFilled(point, 3.0F, IM_COL32(60, 255, 60, 220), 6);
+
+                      if (mouse_over_previous) {
+                        const float dx = mouse_pos.x - point.x;
+                        const float dy = mouse_pos.y - point.y;
+                        const float dist_sq = dx * dx + dy * dy;
+                        if (dist_sq <= max_hover_distance_sq && dist_sq < hovered_prev_distance_sq) {
+                          hovered_prev_distance_sq = dist_sq;
+                          hovered_prev_index = static_cast<int>(keypoint_index);
+                        }
+                      }
+                    }
+
+                    for (std::size_t keypoint_index = 0; keypoint_index < rendered_curr; ++keypoint_index) {
+                      const auto& keypoint = stable_current_keypoints[keypoint_index];
+                      const ImVec2 point(
+                          current_top_left.x + keypoint.pt.x * curr_scale_x,
+                          current_top_left.y + keypoint.pt.y * scale_y);
+                      draw_list->AddCircleFilled(point, 3.0F, IM_COL32(60, 255, 60, 220), 6);
+
+                      if (mouse_over_image) {
+                        const float dx = mouse_pos.x - point.x;
+                        const float dy = mouse_pos.y - point.y;
+                        const float dist_sq = dx * dx + dy * dy;
+                        if (dist_sq <= max_hover_distance_sq && dist_sq < hovered_curr_distance_sq) {
+                          hovered_curr_distance_sq = dist_sq;
+                          hovered_curr_index = static_cast<int>(keypoint_index);
+                        }
+                      }
+                    }
+
+                    if (hovered_prev_index >= 0) {
+                      const auto& hovered_keypoint = stable_previous_keypoints[static_cast<std::size_t>(hovered_prev_index)];
+                      const float u_center = hovered_keypoint.pt.x / static_cast<float>(previous_frame_texture.width);
+                      const float v_center = hovered_keypoint.pt.y / static_cast<float>(previous_frame_texture.height);
+                      const float half_u = (15.0F * 0.5F) / static_cast<float>(previous_frame_texture.width);
+                      const float half_v = (15.0F * 0.5F) / static_cast<float>(previous_frame_texture.height);
+
+                      const ImVec2 uv0(std::clamp(u_center - half_u, 0.0F, 1.0F), std::clamp(v_center - half_v, 0.0F, 1.0F));
+                      const ImVec2 uv1(std::clamp(u_center + half_u, 0.0F, 1.0F), std::clamp(v_center + half_v, 0.0F, 1.0F));
+
+                      ImGui::BeginTooltip();
+                      ImGui::Text("Previous frame ORB feature #%d", hovered_prev_index);
+                      ImGui::Text("x=%.1f, y=%.1f", hovered_keypoint.pt.x, hovered_keypoint.pt.y);
+                      ImGui::Text("response=%.3f", hovered_keypoint.response);
+                      ImGui::Separator();
+                      ImGui::Text("15x15 patch (zoomed)");
+                      ImGui::Image((ImTextureID)(intptr_t)previous_frame_texture.texture_id, ImVec2(180.0F, 180.0F), uv0, uv1);
+                      const ImVec2 patch_min = ImGui::GetItemRectMin();
+                      const ImVec2 patch_max = ImGui::GetItemRectMax();
+                      const ImVec2 patch_center((patch_min.x + patch_max.x) * 0.5F, (patch_min.y + patch_max.y) * 0.5F);
+                      ImDrawList* tooltip_draw_list = ImGui::GetWindowDrawList();
+                      tooltip_draw_list->AddLine(
+                          ImVec2(patch_center.x - 8.0F, patch_center.y - 8.0F),
+                          ImVec2(patch_center.x + 8.0F, patch_center.y + 8.0F),
+                          IM_COL32(255, 80, 80, 255),
+                          2.0F);
+                      tooltip_draw_list->AddLine(
+                          ImVec2(patch_center.x - 8.0F, patch_center.y + 8.0F),
+                          ImVec2(patch_center.x + 8.0F, patch_center.y - 8.0F),
+                          IM_COL32(255, 80, 80, 255),
+                          2.0F);
+                      ImGui::EndTooltip();
+                    } else if (hovered_curr_index >= 0) {
+                      const auto& hovered_keypoint = stable_current_keypoints[static_cast<std::size_t>(hovered_curr_index)];
+                      const float u_center = hovered_keypoint.pt.x / static_cast<float>(dual_current_frame_texture.width);
+                      const float v_center = hovered_keypoint.pt.y / static_cast<float>(dual_current_frame_texture.height);
+                      const float half_u = (15.0F * 0.5F) / static_cast<float>(dual_current_frame_texture.width);
+                      const float half_v = (15.0F * 0.5F) / static_cast<float>(dual_current_frame_texture.height);
+
+                      const ImVec2 uv0(std::clamp(u_center - half_u, 0.0F, 1.0F), std::clamp(v_center - half_v, 0.0F, 1.0F));
+                      const ImVec2 uv1(std::clamp(u_center + half_u, 0.0F, 1.0F), std::clamp(v_center + half_v, 0.0F, 1.0F));
+
+                      ImGui::BeginTooltip();
+                      ImGui::Text("Current frame ORB feature #%d", hovered_curr_index);
+                      ImGui::Text("x=%.1f, y=%.1f", hovered_keypoint.pt.x, hovered_keypoint.pt.y);
+                      ImGui::Text("response=%.3f", hovered_keypoint.response);
+                      ImGui::Separator();
+                      ImGui::Text("15x15 patch (zoomed)");
+                      ImGui::Image((ImTextureID)(intptr_t)dual_current_frame_texture.texture_id, ImVec2(180.0F, 180.0F), uv0, uv1);
+                      const ImVec2 patch_min = ImGui::GetItemRectMin();
+                      const ImVec2 patch_max = ImGui::GetItemRectMax();
+                      const ImVec2 patch_center((patch_min.x + patch_max.x) * 0.5F, (patch_min.y + patch_max.y) * 0.5F);
+                      ImDrawList* tooltip_draw_list = ImGui::GetWindowDrawList();
+                      tooltip_draw_list->AddLine(
+                          ImVec2(patch_center.x - 8.0F, patch_center.y - 8.0F),
+                          ImVec2(patch_center.x + 8.0F, patch_center.y + 8.0F),
+                          IM_COL32(255, 80, 80, 255),
+                          2.0F);
+                      tooltip_draw_list->AddLine(
+                          ImVec2(patch_center.x - 8.0F, patch_center.y + 8.0F),
+                          ImVec2(patch_center.x + 8.0F, patch_center.y - 8.0F),
+                          IM_COL32(255, 80, 80, 255),
+                          2.0F);
+                      ImGui::EndTooltip();
+                    }
+                  }
+
+                  ImGui::Dummy(ImVec2(0.0F, std::max(0.0F, pane_height - std::min(previous_height, current_height))));
+                  ImGui::TextWrapped("Previous: %s", previous_frame_texture.loaded_image_path.c_str());
+                  ImGui::TextWrapped("Current: %s", dual_current_frame_texture.loaded_image_path.c_str());
+                } else {
+                  if (!has_previous_texture) {
+                    ImGui::TextWrapped("%s", previous_frame_error.c_str());
+                  }
+                  if (!has_current_texture) {
+                    ImGui::TextWrapped("%s", dual_current_frame_error.c_str());
+                  }
+                }
+              }
+              ImGui::EndTabItem();
             }
+
+            ImGui::EndTabBar();
           }
 
-          ImGui::TextWrapped("Image: %s", frame_texture.loaded_image_path.c_str());
           ImGui::Text("ORB keypoints: %zu", frame_texture.orb_keypoints.size());
           if (frame_texture.orb_keypoints.size() > 1000) {
             ImGui::Text("Rendering first %d keypoints for UI stability", 1000);
@@ -736,6 +1068,8 @@ int main(int argc, char** argv) {
   ImGui::DestroyContext();
 
   DestroyTexture(&frame_texture);
+  DestroyTexture(&previous_frame_texture);
+  DestroyTexture(&dual_current_frame_texture);
 
   glfwDestroyWindow(window);
   glfwTerminate();
